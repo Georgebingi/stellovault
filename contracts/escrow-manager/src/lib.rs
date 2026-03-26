@@ -388,7 +388,8 @@ impl EscrowManager {
         let protocol_fee = if let Some(treasury) = treasury_opt {
             // Query fee_bps from ProtocolTreasury
             let fee_bps_args: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&env);
-            let fee_bps: u32 = env.invoke_contract(&treasury, &Symbol::new(&env, "get_fee_bps"), fee_bps_args);
+            let fee_bps: u32 =
+                env.invoke_contract(&treasury, &Symbol::new(&env, "get_fee_bps"), fee_bps_args);
 
             // Calculate fee on the escrow amount
             let fee_amount = (escrow.amount * fee_bps as i128) / 10000;
@@ -403,7 +404,8 @@ impl EscrowManager {
                     &env,
                     [escrow.asset.into_val(&env), fee_amount.into_val(&env)],
                 );
-                let _: () = env.invoke_contract(&treasury, &Symbol::new(&env, "deposit_fee"), deposit_args);
+                let _: () =
+                    env.invoke_contract(&treasury, &Symbol::new(&env, "deposit_fee"), deposit_args);
 
                 // Emit fee collection event
                 env.events().publish(
@@ -423,11 +425,7 @@ impl EscrowManager {
         if escrow.asset == escrow.destination_asset {
             // Direct transfer - no conversion needed
             let token_client = token::Client::new(&env, &escrow.asset);
-            token_client.transfer(
-                &env.current_contract_address(),
-                &escrow.seller,
-                &net_amount,
-            );
+            token_client.transfer(&env.current_contract_address(), &escrow.seller, &net_amount);
         } else {
             // Path payment - use Stellar's built-in DEX
             let source_token = token::Client::new(&env, &escrow.asset);
@@ -457,11 +455,7 @@ impl EscrowManager {
             // Execute the path payment
             // Note: In production Stellar contracts, this would use the native path payment
             // host function which automatically finds the best path through the DEX
-            source_token.transfer(
-                &env.current_contract_address(),
-                &escrow.seller,
-                &net_amount,
-            );
+            source_token.transfer(&env.current_contract_address(), &escrow.seller, &net_amount);
 
             // Emit path payment event for tracking
             env.events().publish(
@@ -469,8 +463,6 @@ impl EscrowManager {
                 (escrow_id, net_amount, estimated_dest_amount),
             );
         }
-
-
 
         // Unlock collateral via CollateralRegistry
         let coll_reg: Address = env
