@@ -253,7 +253,6 @@ impl EscrowService {
                 self.update_escrow_status(escrow_id, EscrowStatus::Refunded)
                     .await?;
 
-                // Unlock collateral
                 if let Some(escrow) = self.get_escrow_by_id(escrow_id).await? {
                     self.unlock_collateral(&escrow.collateral_id).await?;
                 }

@@ -47,6 +47,10 @@ impl From<EscrowEventType> for EscrowEvent {
                 escrow_id,
                 released_by: "contract".to_string() 
             },
+            EscrowEventType::Refunded { escrow_id } => EscrowEvent::Released {
+                escrow_id,
+                released_by: "refund".to_string(),
+            },
             EscrowEventType::Cancelled { escrow_id } => EscrowEvent::Cancelled { 
                 escrow_id, 
                 reason: "cancelled_by_party".to_string() 
@@ -191,8 +195,8 @@ impl EventBuffer {
         let event_id = self.next_event_id;
         self.next_event_id += 1;
         
-        // Remove expired events
-        let cutoff = now.checked_sub(self.max_duration).unwrap_or(now);
+        // Remove expired events older than max_duration
+        let cutoff = now - self.max_duration;
         self.events.retain(|e| e.timestamp > cutoff);
         
         // Add new event
@@ -592,13 +596,19 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
                 }
                 Message::Ping(_data) => {
                     // Respond to ping with pong
-                    let now_secs = std::time::SystemTime::now()
+                    let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
+                    let ping_ts = if data.len() >= 8 {
+                        let arr: [u8; 8] = data[..8].try_into().unwrap_or_default();
+                        u64::from_le_bytes(arr)
+                    } else {
+                        0
+                    };
                     let _ = internal_tx.send(ServerMessage::Pong {
-                        timestamp: now_secs,
-                        server_time: now_secs,
+                        timestamp: ping_ts,
+                        server_time: ts,
                     }).await;
                     state_recv.update_heartbeat(&client_id_recv).await;
                 }
@@ -680,7 +690,10 @@ impl WsState {
                     .as_secs();
                 let _ = sender.send(ServerMessage::Pong {
                     timestamp: timestamp.unwrap_or(0),
-                    server_time: now_secs,
+                    server_time: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
                 }).await;
                 state.update_heartbeat(client_id).await;
             }

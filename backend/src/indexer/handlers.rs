@@ -200,7 +200,7 @@ impl EventHandler {
                     .await?;
 
                     if let Some(ws) = &self.ws_state {
-                        ws.broadcast_event(WsEvent::Escrow(WsEscrowEvent::Disputed {
+                        ws.broadcast_event(crate::websocket::WsEvent::Escrow(WsEscrowEvent::Disputed {
                             escrow_id: id as i64,
                             dispute_reason: "on-chain dispute raised".to_string(),
                         }))
@@ -233,14 +233,8 @@ impl EventHandler {
 
                     if let Some(ws) = &self.ws_state {
                         match decision_raw {
-                            0 => ws.broadcast_event(WsEvent::Escrow(WsEscrowEvent::Released { 
-                                escrow_id: id as i64,
-                                released_by: "dispute_resolution".to_string(),
-                            })).await,
-                            1 => ws.broadcast_event(WsEvent::Escrow(WsEscrowEvent::Cancelled { 
-                                escrow_id: id as i64,
-                                reason: "refunded_by_dispute".to_string(),
-                            })).await,
+                            0 => ws.broadcast_event(crate::websocket::WsEvent::Escrow(WsEscrowEvent::Released { escrow_id: id as i64, released_by: "contract".to_string() })).await,
+                            1 => ws.broadcast_event(crate::websocket::WsEvent::Escrow(WsEscrowEvent::Released { escrow_id: id as i64, released_by: "refund".to_string() })).await,
                             _ => {}
                         }
                     }

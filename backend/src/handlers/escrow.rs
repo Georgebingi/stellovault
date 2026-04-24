@@ -15,6 +15,7 @@ use crate::escrow::{
 };
 use crate::websocket::WsEvent;
 use crate::loan::{CreateLoanRequest, ListLoansQuery, Loan, Repayment, RepaymentRequest};
+use crate::websocket::{WsEvent, EscrowEvent as WsEscrowEvent};
 use crate::models::{ApiResponse, User};
 use crate::state::AppState;
 
@@ -83,14 +84,10 @@ pub async fn create_escrow(
             // Broadcast creation event
             app_state
                 .ws_state
-                .broadcast_event(WsEvent::Escrow(
-                    EscrowEvent::Created {
-                        escrow_id: response.escrow_id,
-                        buyer_id,
-                        seller_id,
-                    }
-                    .into(),
-                ))
+                .broadcast_event(WsEvent::Escrow(WsEscrowEvent::Created {
+                    escrow_id: response.escrow_id,
+                    data: serde_json::json!({ "buyer_id": buyer_id, "seller_id": seller_id }),
+                }))
                 .await;
 
             Ok(Json(ApiResponse {
@@ -224,10 +221,8 @@ pub async fn webhook_escrow_update(
         }
 
         // Broadcast update
-        app_state
-            .ws_state
-            .broadcast_event(WsEvent::Escrow(event.into()))
-            .await;
+        let ws_event = WsEvent::Escrow(WsEscrowEvent::from(event));
+        app_state.ws_state.broadcast_event(ws_event).await;
     }
 
     Ok(Json(ApiResponse {
