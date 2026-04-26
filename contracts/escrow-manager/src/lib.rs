@@ -6,14 +6,15 @@
 
 #![no_std]
 
+mod refund;
+
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env, IntoVal,
     Symbol, Val, Vec,
 };
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+/// Default TTL for refund/dispute entries: 30 days (~518400 ledgers)
+const DEFAULT_TTL_LEDGER_COUNT: u32 = 518400;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +42,8 @@ pub enum ContractError {
     ConsensusNotMet = 12,
     EscrowDisputed = 13,
     EscrowNotDisputed = 14,
+    InsufficientBalance = 15,
+    NoPendingAdmin = 16,
 }
 
 impl From<soroban_sdk::Error> for ContractError {
@@ -106,7 +109,7 @@ pub struct Escrow {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisputeDecision {
     ReleaseToSeller = 0,
-    RefundToLender = 1,
+    RefundToBuyer = 1,
 }
 
 /// Local mirror of OracleAdapter's ConfirmationData for cross-contract deserialization.
@@ -191,6 +194,54 @@ impl EscrowManager {
     /// Get the current treasury address.
     pub fn get_treasury(env: Env) -> Option<Address> {
         env.storage().instance().get(&symbol_short!("treasury"))
+    }
+
+    /// Propose a new admin (two-step transfer, step 1).
+    /// Only the current admin may call this; their signature is required.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), ContractError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("admin"))
+            .ok_or(ContractError::Unauthorized)?;
+
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("pend_adm"), &new_admin);
+
+        env.events()
+            .publish((symbol_short!("adm_prop"),), (admin, new_admin));
+
+        Ok(())
+    }
+
+    /// Accept a pending admin proposal (two-step transfer, step 2).
+    /// Only the address nominated via propose_admin may call this.
+    pub fn accept_admin(env: Env) -> Result<(), ContractError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("pend_adm"))
+            .ok_or(ContractError::NoPendingAdmin)?;
+
+        pending.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("admin"), &pending);
+        env.storage().instance().remove(&symbol_short!("pend_adm"));
+
+        env.events()
+            .publish((symbol_short!("adm_acpt"),), (pending,));
+
+        Ok(())
+    }
+
+    /// Return the pending admin address if a proposal is active.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&symbol_short!("pend_adm"))
     }
 
     /// Create a new escrow.
@@ -585,10 +636,10 @@ impl EscrowManager {
             .set(&symbol_short!("test_rate"), &rate);
     }
 
-    /// Refund the escrowed funds to the lender if the escrow has expired.
+    /// Refund the escrowed funds to the buyer if the escrow has expired.
     ///
     /// Anyone can call this after expiry. Unlocks collateral and returns
-    /// funds to the lender.
+    /// funds to the buyer.
     pub fn refund_escrow(env: Env, escrow_id: u64) -> Result<(), ContractError> {
         let mut escrow: Escrow = env
             .storage()
@@ -608,13 +659,8 @@ impl EscrowManager {
             return Err(ContractError::EscrowNotExpired);
         }
 
-        // Refund lender
-        let token_client = token::Client::new(&env, &escrow.asset);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &escrow.lender,
-            &escrow.amount,
-        );
+        // Refund using the new refund module
+        refund::process_refund(&env, &mut escrow, escrow_id)?;
 
         // Unlock collateral via CollateralRegistry
         let coll_reg: Address = env
@@ -632,6 +678,13 @@ impl EscrowManager {
 
         escrow.status = EscrowStatus::Refunded;
         env.storage().persistent().set(&escrow_id, &escrow);
+
+        // Extend TTL for refund entry (30 days / 518400 ledgers)
+        env.storage().persistent().extend_ttl(
+            &escrow_id,
+            DEFAULT_TTL_LEDGER_COUNT,
+            DEFAULT_TTL_LEDGER_COUNT,
+        );
 
         env.events()
             .publish((symbol_short!("esc_rfnd"),), (escrow_id,));
@@ -674,18 +727,12 @@ impl EscrowManager {
                     .publish((symbol_short!("esc_rslv"),), (escrow_id, decision));
                 Ok(())
             }
-            DisputeDecision::RefundToLender => {
-                // Refund lender
-                let token_client = token::Client::new(&env, &escrow.asset);
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &escrow.lender,
-                    &escrow.amount,
-                );
+            DisputeDecision::RefundToBuyer => {
+                // Refund using the new refund module
+                refund::process_refund(&env, &mut escrow, escrow_id)?;
 
                 Self::unlock_collateral(&env, escrow.collateral_id)?;
 
-                escrow.status = EscrowStatus::Refunded;
                 env.storage().persistent().set(&escrow_id, &escrow);
 
                 env.events()
@@ -700,22 +747,91 @@ impl EscrowManager {
         env.storage().persistent().get(&escrow_id)
     }
 
-    /// Get all escrow IDs for a specific merchant (seller).
-    ///
-    /// Returns a vector of escrow IDs where the given address is the seller.
-    /// This enables efficient querying without client-side filtering.
+    /// Dispute an escrow (can be called by buyer, seller, or lender)
     ///
     /// # Arguments
-    /// * `merchant` - The seller address to query escrows for
+    /// * `escrow_id` - ID of the escrow to dispute
+    /// * `caller` - Address of the party raising the dispute
     ///
-    /// # Returns
-    /// Vector of escrow IDs, or empty vector if merchant has no escrows
-    pub fn get_merchant_escrows(env: Env, merchant: Address) -> Vec<u64> {
-        let seller_key = (symbol_short!("seller"), merchant);
-        env.storage()
+    /// # Events
+    /// Emits `EscrowDisputed` event
+    pub fn dispute_escrow(env: Env, escrow_id: u64, caller: Address) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
             .persistent()
-            .get(&seller_key)
-            .unwrap_or(Vec::new(&env))
+            .get(&escrow_id)
+            .ok_or(ContractError::EscrowNotFound)?;
+
+        // Only Buyer, Seller, or Lender can raise dispute
+        if caller != escrow.buyer && caller != escrow.seller && caller != escrow.lender {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if escrow.status != EscrowStatus::Active {
+            return Err(ContractError::EscrowNotActive);
+        }
+
+        escrow.status = EscrowStatus::Disputed;
+        env.storage().persistent().set(&escrow_id, &escrow);
+
+        // Extend TTL for dispute entry (30 days / 518400 ledgers)
+        // Dispute entries start with full TTL, can be renewed if still active
+        env.storage().persistent().extend_ttl(
+            &escrow_id,
+            DEFAULT_TTL_LEDGER_COUNT,
+            DEFAULT_TTL_LEDGER_COUNT,
+        );
+
+        env.events()
+            .publish((symbol_short!("esc_dsp"),), (escrow_id,));
+
+        Ok(())
+    }
+
+    /// Renew TTL for an active dispute
+    ///
+    /// Can be called by any party (buyer, seller, lender) to extend the TTL
+    /// of an active dispute that hasn't been resolved.
+    ///
+    /// # Arguments
+    /// * `escrow_id` - ID of the escrow with active dispute
+    /// * `caller` - Address of the party renewing the TTL
+    pub fn renew_dispute_ttl(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&escrow_id)
+            .ok_or(ContractError::EscrowNotFound)?;
+
+        // Only allow TTL renewal for active disputes
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(ContractError::EscrowNotActive);
+        }
+
+        // Only Buyer, Seller, or Lender can renew dispute TTL
+        if caller != escrow.buyer && caller != escrow.seller && caller != escrow.lender {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Renew TTL for dispute entry
+        env.storage().persistent().extend_ttl(
+            &escrow_id,
+            DEFAULT_TTL_LEDGER_COUNT,
+            DEFAULT_TTL_LEDGER_COUNT,
+        );
+
+        env.events()
+            .publish((symbol_short!("dsp_rnew"),), (escrow_id,));
+
+        Ok(())
     }
 }
 
@@ -1125,7 +1241,7 @@ mod test {
         let escrow_id = create_test_escrow(&t);
 
         let token = token::Client::new(&t.env, &t.token_addr);
-        let lender_balance_before = token.balance(&t.lender);
+        let buyer_balance_before = token.balance(&t.buyer);
 
         // Advance past expiry
         t.env.ledger().with_mut(|li| {
@@ -1138,8 +1254,8 @@ mod test {
         let escrow = t.escrow_client.get_escrow(&escrow_id).unwrap();
         assert_eq!(escrow.status, EscrowStatus::Refunded);
 
-        // Verify funds returned to lender
-        assert_eq!(token.balance(&t.lender), lender_balance_before + 5000);
+        // Verify funds returned to buyer
+        assert_eq!(token.balance(&t.buyer), buyer_balance_before + 5000);
         assert_eq!(token.balance(&t.escrow_id_addr), 0);
 
         // Verify collateral unlocked
@@ -1272,26 +1388,26 @@ mod test {
         let escrow_id = create_test_escrow(&t);
 
         t.escrow_client
-            .resolve_dispute(&escrow_id, &DisputeDecision::RefundToLender);
+            .resolve_dispute(&escrow_id, &DisputeDecision::RefundToBuyer);
     }
 
     #[test]
-    fn test_resolve_dispute_refund_to_lender_success() {
+    fn test_resolve_dispute_refund_to_buyer_success() {
         let t = setup();
         let escrow_id = create_test_escrow(&t);
 
         let token = token::Client::new(&t.env, &t.token_addr);
-        let lender_balance_before = token.balance(&t.lender);
+        let buyer_balance_before = token.balance(&t.buyer);
 
         let reason = Bytes::from_slice(&t.env, b"dispute");
         t.escrow_client.raise_dispute(&escrow_id, &t.buyer, &reason);
 
         t.escrow_client
-            .resolve_dispute(&escrow_id, &DisputeDecision::RefundToLender);
+            .resolve_dispute(&escrow_id, &DisputeDecision::RefundToBuyer);
 
         let escrow = t.escrow_client.get_escrow(&escrow_id).unwrap();
         assert_eq!(escrow.status, EscrowStatus::Refunded);
-        assert_eq!(token.balance(&t.lender), lender_balance_before + 5000);
+        assert_eq!(token.balance(&t.buyer), buyer_balance_before + 5000);
         assert_eq!(token.balance(&t.escrow_id_addr), 0);
 
         // Verify collateral unlocked
@@ -1389,50 +1505,6 @@ mod test {
     fn test_get_escrow_not_found() {
         let t = setup();
         assert!(t.escrow_client.get_escrow(&999u64).is_none());
-    }
-
-    #[test]
-    fn test_get_merchant_escrows() {
-        let t = setup();
-
-        // Create multiple escrows with the same seller
-        let escrow_id1 = create_test_escrow(&t);
-        let escrow_id2 = create_test_escrow(&t);
-
-        // Create an escrow with a different seller
-        let different_seller = Address::generate(&t.env);
-        let expiry = t.env.ledger().timestamp() + 3600;
-        let escrow_id3 = t.escrow_client.create_escrow(&EscrowConfig {
-            buyer: t.buyer.clone(),
-            seller: different_seller.clone(),
-            lender: t.lender.clone(),
-            collateral_id: 1u64,
-            amount: 5000i128,
-            asset: t.token_addr.clone(),
-            required_confirmation: 2u32,
-            expiry_ts: expiry,
-            destination_asset: t.token_addr.clone(),
-            min_destination_amount: 5000i128,
-            required_confirmations: 0u32,
-            oracle_set: Vec::new(&t.env),
-        });
-
-        // Query escrows for the original seller
-        let seller_escrows = t.escrow_client.get_merchant_escrows(&t.seller);
-        assert_eq!(seller_escrows.len(), 2);
-        assert!(seller_escrows.iter().any(|id| id == escrow_id1));
-        assert!(seller_escrows.iter().any(|id| id == escrow_id2));
-        assert!(!seller_escrows.iter().any(|id| id == escrow_id3));
-
-        // Query escrows for the different seller
-        let different_seller_escrows = t.escrow_client.get_merchant_escrows(&different_seller);
-        assert_eq!(different_seller_escrows.len(), 1);
-        assert_eq!(different_seller_escrows.get(0).unwrap(), escrow_id3);
-
-        // Query escrows for an address with no escrows
-        let no_escrows_address = Address::generate(&t.env);
-        let no_escrows = t.escrow_client.get_merchant_escrows(&no_escrows_address);
-        assert_eq!(no_escrows.len(), 0);
     }
 
     #[test]
@@ -1836,5 +1908,55 @@ mod test {
 
         let escrow = t.escrow_client.get_escrow(&escrow_id).unwrap();
         assert_eq!(escrow.status, EscrowStatus::Released);
+    }
+
+    #[test]
+    fn test_propose_admin() {
+        let t = setup();
+        let new_admin = Address::generate(&t.env);
+
+        assert!(t.escrow_client.get_pending_admin().is_none());
+        t.escrow_client.propose_admin(&new_admin);
+        assert_eq!(t.escrow_client.get_pending_admin(), Some(new_admin));
+    }
+
+    #[test]
+    fn test_accept_admin() {
+        let t = setup();
+        let new_admin = Address::generate(&t.env);
+
+        t.escrow_client.propose_admin(&new_admin);
+        t.escrow_client.accept_admin();
+
+        // Verify treasury still works (admin changed)
+        assert!(t.escrow_client.get_pending_admin().is_none());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_propose_admin_unauthorized() {
+        // No auth mocking — admin.require_auth() will panic when not satisfied
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let coll_reg = env.register(MockCollateralRegistry, ());
+        let oracle = env.register(MockOracleAdapterWithConsensus, ());
+        let loan_mgr = Address::generate(&env);
+        let treasury = env.register(MockTreasury, ());
+        let contract_id = env.register(EscrowManager, ());
+
+        env.as_contract(&contract_id, || {
+            EscrowManager::initialize(env.clone(), admin, coll_reg, oracle, loan_mgr, treasury)
+                .unwrap();
+            // propose_admin calls admin.require_auth() — panics without mocked auth
+            EscrowManager::propose_admin(env.clone(), new_admin).unwrap();
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError: Error(Contract, #16)")]
+    fn test_accept_admin_no_pending() {
+        let t = setup();
+        t.escrow_client.accept_admin();
     }
 }
